@@ -1,0 +1,190 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>E-Voting (Commit-Reveal)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; max-width: 860px; margin: 24px auto; padding: 0 12px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin: 16px 0; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
+    input, select { padding: 8px; width: 100%; margin: 6px 0 12px; }
+    .ok { color: green; } .err { color: #b00; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.11.1/dist/ethers.umd.min.js"></script>
+</head>
+<body>
+  <h1>E-Voting (Commit-Reveal)</h1>
+  <p>Contract: <code id="addr">(set below)</code></p>
+
+  <div class="card">
+    <h3>0) Settings</h3>
+    <label>Contract Address</label>
+    <input id="contractAddr" placeholder="0x..." />
+    <button id="btnSetAddr">Use Address</button>
+    <div id="setAddrMsg"></div>
+  </div>
+
+  <div class="card">
+    <h3>1) Connect Wallet</h3>
+    <button id="btnConnect">Connect MetaMask</button>
+    <div id="acct"></div>
+    <small>Make sure MetaMask is on the local chain (RPC: <code>http://127.0.0.1:9545</code>, Chain ID ~ <code>5777</code>).</small>
+  </div>
+
+  <div class="card">
+    <h3>2) Register (Email → Backend → Signature → On-Chain)</h3>
+    <input id="email" placeholder="you@example.com" />
+    <button id="btnAuthorize">Get Authorization Signature</button>
+    <div id="authMsg"></div>
+    <button id="btnRegister">Call registerVoter(signature)</button>
+    <div id="regMsg"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Commit Vote</h3>
+    <label>Candidate</label>
+    <select id="candidate">
+      <option value="0">Alice</option>
+      <option value="1">Bob</option>
+      <option value="2">Charlie</option>
+    </select>
+    <button id="btnCommit">Commit</button>
+    <div id="commitMsg"></div>
+  </div>
+
+  <div class="card">
+    <h3>4) Reveal Vote</h3>
+    <input id="salt" placeholder="(auto-generated on commit; keep it safe!)" />
+    <button id="btnReveal">Reveal</button>
+    <div id="revealMsg"></div>
+  </div>
+
+  <div class="card">
+    <h3>5) Results</h3>
+    <button id="btnResults">Get Results</button>
+    <pre id="results"></pre>
+  </div>
+
+<script>
+(function() {
+  // ====== Adjust these if needed ======
+  const BACKEND_URL = "http://localhost:4000";
+
+  const ABI = [
+    "function registerVoter(bytes signature)",
+    "function commitVote(bytes32 commitment)",
+    "function revealVote(uint256 candidateId, bytes32 salt)",
+    "function getResults() view returns (uint256[])",
+    "function candidatesCount() view returns (uint256)"
+  ];
+  // ====================================
+
+  let provider, signer, account, contract;
+
+  // Helpers
+  function ok(el, msg) { el.innerHTML = `<span class="ok">${msg}</span>`; }
+  function err(el, msg) { el.innerHTML = `<span class="err">${msg}</span>`; }
+
+  function randSalt() {
+    const arr = crypto.getRandomValues(new Uint8Array(32));
+    return "0x" + Array.from(arr).map(b => b.toString(16).padStart(2,'0')).join('');
+  }
+
+  function setContract(addr) {
+    try {
+      contract = new ethers.Contract(addr, ABI, signer);
+      document.getElementById('addr').textContent = addr;
+      window.localStorage.setItem('votingAddress', addr);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Actions
+  async function connect() {
+    if (!window.ethereum) { alert("Install MetaMask"); return; }
+    provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    signer = await provider.getSigner();
+    account = await signer.getAddress();
+    document.getElementById('acct').textContent = "Connected: " + account;
+
+    // Load saved address if exists
+    const saved = window.localStorage.getItem('votingAddress');
+    if (saved) setContract(saved);
+  }
+
+  async function authorize() {
+    const email = document.getElementById('email').value.trim();
+    if (!email) return err(authMsg, "Enter email.");
+    const r = await fetch(`${BACKEND_URL}/api/authorize`, {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ email, voterAddress: account })
+    });
+    const data = await r.json();
+    if (data.error) return err(authMsg, data.error);
+    window.localStorage.setItem("regSig", data.signature);
+    ok(authMsg, "Got registration signature.");
+  }
+
+  async function register() {
+    const sig = window.localStorage.getItem("regSig");
+    if (!sig) return err(regMsg, "Get authorization signature first.");
+    if (!contract) return err(regMsg, "Set contract address first.");
+    const tx = await contract.connect(signer).registerVoter(sig);
+    await tx.wait();
+    ok(regMsg, "Registered!");
+  }
+
+  async function commit() {
+    const candidateId = parseInt(document.getElementById('candidate').value, 10);
+    const salt = randSalt();
+    window.localStorage.setItem("salt", salt);
+    document.getElementById('salt').value = salt;
+
+    const commitment = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ["uint256","bytes32","address"], [candidateId, salt, account]
+      )
+    );
+    if (!contract) return err(commitMsg, "Set contract address first.");
+    const tx = await contract.connect(signer).commitVote(commitment);
+    await tx.wait();
+    ok(commitMsg, "Committed. Keep your salt safe!");
+  }
+
+  async function reveal() {
+    const candidateId = parseInt(document.getElementById('candidate').value, 10);
+    const salt = document.getElementById('salt').value || window.localStorage.getItem("salt");
+    if (!salt) return err(revealMsg, "Salt missing.");
+    if (!contract) return err(revealMsg, "Set contract address first.");
+    const tx = await contract.connect(signer).revealVote(candidateId, salt);
+    await tx.wait();
+    ok(revealMsg, "Revealed.");
+  }
+
+  async function results() {
+    if (!contract) return alert("Set contract address first.");
+    const res = await contract.getResults();
+    document.getElementById('results').textContent = JSON.stringify(res.map(x=>x.toString()), null, 2);
+  }
+
+  // UI hooks
+  btnConnect.onclick   = connect;
+  btnSetAddr.onclick   = () => {
+    const addr = document.getElementById('contractAddr').value.trim();
+    setContract(addr) ? ok(setAddrMsg, "Contract set.") : err(setAddrMsg, "Bad address.");
+  };
+  btnAuthorize.onclick = () => authorize().catch(e=>err(authMsg, e.message));
+  btnRegister.onclick  = () => register().catch(e=>err(regMsg, e.message));
+  btnCommit.onclick    = () => commit().catch(e=>err(commitMsg, e.message));
+  btnReveal.onclick    = () => reveal().catch(e=>err(revealMsg, e.message));
+  btnResults.onclick   = () => results().catch(e=>alert(e.message));
+})();
+</script>
+</body>
+</html>
